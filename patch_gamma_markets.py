@@ -127,22 +127,45 @@ def apply_gamma_markets_patch():
         async def _load_all_using_gamma_markets(self, filters: dict | None = None) -> None:
             """
             Load all instruments using Gamma API with proper server-side filtering.
-            This is the CORRECT implementation that respects time filters.
+            Batches slug lists into groups of 20 to avoid HTTP 414 (URL too long).
+            289 slugs for 5m markets vs 97 for 15m — batching is required for 5m.
             """
             filters = filters.copy() if filters is not None else {}
-            
-            # Set reasonable defaults
+
             if "limit" not in filters:
-                filters["limit"] = 1000  # Get as many as possible per request
-            
-            self._log.info(f"Requesting markets from Gamma API with filters: {filters}")
-            
+                filters["limit"] = 300
+
+            # Pull slug list out and batch it — 289 slugs at once causes HTTP 414
+            SLUG_BATCH_SIZE = 20
+            slug_list = list(filters.pop("slug", None) or [])
+
+            self._log.info(f"Loading {len(slug_list)} slugs in batches of {SLUG_BATCH_SIZE}")
+
             try:
-                markets = await gamma_markets.list_markets(
-                    http_client=self._http_client, 
-                    filters=filters,
-                    timeout=120.0
-                )
+                markets = []
+                if slug_list:
+                    batches = [slug_list[i:i + SLUG_BATCH_SIZE]
+                               for i in range(0, len(slug_list), SLUG_BATCH_SIZE)]
+                    for batch_num, batch in enumerate(batches):
+                        batch_filters = {**filters, "slug": tuple(batch)}
+                        self._log.debug(
+                            f"Fetching batch {batch_num + 1}/{len(batches)} ({len(batch)} slugs)"
+                        )
+                        try:
+                            batch_markets = await gamma_markets.list_markets(
+                                http_client=self._http_client,
+                                filters=batch_filters,
+                                timeout=30.0,
+                            )
+                            markets.extend(batch_markets)
+                        except Exception as e:
+                            self._log.warning(f"Batch {batch_num + 1} failed: {e}")
+                else:
+                    markets = await gamma_markets.list_markets(
+                        http_client=self._http_client,
+                        filters=filters,
+                        timeout=120.0,
+                    )
                 
                 self._log.info(f"✓ Gamma API returned {len(markets)} markets")
                 
