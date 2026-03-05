@@ -312,7 +312,6 @@ class IntegratedBTCStrategy(Strategy):
         self._load_all_btc_instruments()
 
         if self.instrument_id:
-            self.subscribe_quote_ticks(self.instrument_id)
             logger.info(f"✓ SUBSCRIBED to market: {self.instrument_id}")
             try:
                 quote = self.cache.quote_tick(self.instrument_id)
@@ -322,6 +321,8 @@ class IntegratedBTCStrategy(Strategy):
                     logger.info(f"✓ Initial price: ${float(p):.4f}")
             except Exception:
                 pass
+        else:
+            logger.warning("No active market InstrumentId yet — waiting for market open")
 
         if len(self.price_history) < 20:
             self._generate_synthetic_history(target_count=20, existing_count=len(self.price_history))
@@ -344,21 +345,20 @@ class IntegratedBTCStrategy(Strategy):
 
     def _load_all_btc_instruments(self):
         """
-        Fetch BTC 5-min markets directly from the Gamma API.
+        Fetch BTC 5-min markets directly from the Gamma API and build
+        proper Nautilus InstrumentId objects from conditionId + tokenId.
 
-        self.cache.instruments() (the Nautilus engine cache) is populated
-        asynchronously via the message bus and is frequently empty when
-        on_start() fires.  We bypass it entirely and call the Gamma API
-        ourselves so markets are always available from the very first tick.
+        self.cache.instruments() is populated asynchronously and is always
+        empty when on_start() fires — we bypass it entirely.
         """
         import urllib.request
         import json as _json
         from urllib.parse import urlencode
+        from nautilus_trader.adapters.polymarket.common.symbol import get_polymarket_instrument_id
 
         now = datetime.now(timezone.utc)
         current_ts = int(now.timestamp())
 
-        # 1 prior + next 24 h worth of 5-min markets
         base_ts = (current_ts // MARKET_INTERVAL_SECONDS) * MARKET_INTERVAL_SECONDS
         slugs = [
             f"btc-updown-5m-{base_ts + i * MARKET_INTERVAL_SECONDS}"
@@ -368,7 +368,6 @@ class IntegratedBTCStrategy(Strategy):
         logger.info("=" * 80)
         logger.info(f"Fetching {len(slugs)} BTC 5-min slugs from Gamma API...")
 
-        # Batch into groups of 20 to stay under URL length limits
         BATCH = 20
         raw_markets: list = []
         batches = [slugs[i:i + BATCH] for i in range(0, len(slugs), BATCH)]
@@ -376,18 +375,14 @@ class IntegratedBTCStrategy(Strategy):
             params = [("slug", s) for s in batch]
             url = "https://gamma-api.polymarket.com/markets?" + urlencode(params)
             try:
-                req = urllib.request.Request(
-                    url, headers={"User-Agent": "PolymarketBot/1.0"}
-                )
+                req = urllib.request.Request(url, headers={"User-Agent": "PolymarketBot/1.0"})
                 with urllib.request.urlopen(req, timeout=10) as resp:
-                    data = _json.loads(resp.read())
-                    raw_markets.extend(data)
+                    raw_markets.extend(_json.loads(resp.read()))
             except Exception as e:
                 logger.warning(f"  Batch {idx + 1}/{len(batches)} failed: {e}")
 
         logger.info(f"Gamma API returned {len(raw_markets)} total records")
 
-        # Build instrument entries from raw API data
         seen_slugs: dict = {}
         btc_instruments: list = []
 
@@ -403,11 +398,15 @@ class IntegratedBTCStrategy(Strategy):
 
             end_timestamp = market_timestamp + MARKET_INTERVAL_SECONDS
             if end_timestamp <= current_ts:
-                continue  # already expired
+                continue
+
+            if slug in seen_slugs:
+                continue
 
             time_diff = market_timestamp - current_ts
 
-            # Extract YES/NO token IDs from clobTokenIds
+            # Extract token IDs and build proper Nautilus InstrumentId objects
+            condition_id = mkt.get("conditionId", "")
             clob_ids = mkt.get("clobTokenIds", [])
             if isinstance(clob_ids, str):
                 try:
@@ -418,17 +417,18 @@ class IntegratedBTCStrategy(Strategy):
             yes_token_id = clob_ids[0] if len(clob_ids) > 0 else None
             no_token_id  = clob_ids[1] if len(clob_ids) > 1 else None
 
-            # Try to resolve a Nautilus InstrumentId from engine cache
-            # (may be None if cache not propagated yet — OK, we use token IDs directly)
-            instrument_id = None
-            for inst in self.cache.instruments():
-                if hasattr(inst, "info") and inst.info:
-                    if inst.info.get("market_slug", "").lower() == slug:
-                        instrument_id = inst.id
-                        break
-
-            if slug in seen_slugs:
-                continue
+            yes_instrument_id = None
+            no_instrument_id  = None
+            if condition_id and yes_token_id:
+                try:
+                    yes_instrument_id = get_polymarket_instrument_id(condition_id, yes_token_id)
+                except Exception as e:
+                    logger.warning(f"Could not build YES InstrumentId for {slug}: {e}")
+            if condition_id and no_token_id:
+                try:
+                    no_instrument_id = get_polymarket_instrument_id(condition_id, no_token_id)
+                except Exception as e:
+                    logger.warning(f"Could not build NO InstrumentId for {slug}: {e}")
 
             entry = {
                 "slug":              slug,
@@ -440,11 +440,11 @@ class IntegratedBTCStrategy(Strategy):
                 "time_diff_minutes": time_diff / 60,
                 "yes_token_id":      yes_token_id,
                 "no_token_id":       no_token_id,
-                # instrument may be None — subscribe_quote_ticks handled below
+                "condition_id":      condition_id,
                 "instrument":        None,
-                "instrument_id":     instrument_id,
-                "yes_instrument_id": instrument_id,
-                "no_instrument_id":  None,
+                "instrument_id":     yes_instrument_id,
+                "yes_instrument_id": yes_instrument_id,
+                "no_instrument_id":  no_instrument_id,
             }
             seen_slugs[slug] = entry
             btc_instruments.append(entry)
@@ -456,9 +456,10 @@ class IntegratedBTCStrategy(Strategy):
         for i, inst in enumerate(btc_instruments[:10]):
             is_active = inst["time_diff_minutes"] <= 0 and inst["end_timestamp"] > current_ts
             status = "ACTIVE" if is_active else ("FUTURE" if inst["time_diff_minutes"] > 0 else "PAST")
+            has_id = "✓" if inst["yes_instrument_id"] else "✗"
             logger.info(
                 f"  [{i}] {inst['slug']}: {status} "
-                f"({inst['start_time'].strftime('%H:%M')}-{inst['end_time'].strftime('%H:%M')})"
+                f"({inst['start_time'].strftime('%H:%M')}-{inst['end_time'].strftime('%H:%M')}) id={has_id}"
             )
         if len(btc_instruments) > 10:
             logger.info(f"  ... and {len(btc_instruments) - 10} more")
@@ -466,40 +467,39 @@ class IntegratedBTCStrategy(Strategy):
 
         self.all_btc_instruments = btc_instruments
 
-        # Select current or nearest upcoming market
+        # Select current active market or nearest upcoming
         for i, inst in enumerate(btc_instruments):
             is_active = inst["time_diff_minutes"] <= 0 and inst["end_timestamp"] > current_ts
             if is_active:
                 self.current_instrument_index = i
-                self.next_switch_time = inst["end_time"]
-                self._yes_token_id    = inst.get("yes_token_id")
-                self._no_token_id     = inst.get("no_token_id")
-                inst_id = inst.get("instrument_id")
-                if inst_id:
-                    self.instrument_id        = inst_id
-                    self._yes_instrument_id   = inst_id
-                    self._no_instrument_id    = inst.get("no_instrument_id")
-                    self.subscribe_quote_ticks(self.instrument_id)
+                self.next_switch_time         = inst["end_time"]
+                self._yes_token_id            = inst.get("yes_token_id")
+                self._no_token_id             = inst.get("no_token_id")
+                self.instrument_id            = inst.get("yes_instrument_id")
+                self._yes_instrument_id       = inst.get("yes_instrument_id")
+                self._no_instrument_id        = inst.get("no_instrument_id")
                 logger.info(f"✓ CURRENT MARKET: {inst['slug']}")
                 logger.info(f"  Ends at: {self.next_switch_time.strftime('%H:%M:%S')}")
+                if self.instrument_id:
+                    self.subscribe_quote_ticks(self.instrument_id)
+                else:
+                    logger.warning(f"  No InstrumentId for {inst['slug']} — cannot subscribe yet")
                 return
 
         if btc_instruments:
             future = [inst for inst in btc_instruments if inst["time_diff_minutes"] > 0]
             nearest = min(future, key=lambda x: x["time_diff_minutes"]) if future else btc_instruments[-1]
-            nearest_idx = btc_instruments.index(nearest)
-            self.current_instrument_index = nearest_idx
-            self._yes_token_id  = nearest.get("yes_token_id")
-            self._no_token_id   = nearest.get("no_token_id")
-            self.next_switch_time = nearest["start_time"]
-            inst_id = nearest.get("instrument_id")
-            if inst_id:
-                self.instrument_id      = inst_id
-                self._yes_instrument_id = inst_id
-                self._no_instrument_id  = nearest.get("no_instrument_id")
-                self.subscribe_quote_ticks(self.instrument_id)
+            self.current_instrument_index = btc_instruments.index(nearest)
+            self.next_switch_time         = nearest["start_time"]
+            self._yes_token_id            = nearest.get("yes_token_id")
+            self._no_token_id             = nearest.get("no_token_id")
+            self.instrument_id            = nearest.get("yes_instrument_id")
+            self._yes_instrument_id       = nearest.get("yes_instrument_id")
+            self._no_instrument_id        = nearest.get("no_instrument_id")
             logger.info(f"⚠ Waiting for next market: {nearest['slug']} in {nearest['time_diff_minutes']:.1f} min")
             self._waiting_for_market_open = True
+            if self.instrument_id:
+                self.subscribe_quote_ticks(self.instrument_id)
 
     def _switch_to_next_market(self):
         if not self.all_btc_instruments:
@@ -517,14 +517,12 @@ class IntegratedBTCStrategy(Strategy):
             return False
 
         self.current_instrument_index = next_index
-        inst_id = next_market.get('instrument_id') or (
-            next_market['instrument'].id if next_market.get('instrument') else None
-        )
-        self.instrument_id = inst_id
-        self.next_switch_time = next_market['end_time']
-        self._yes_token_id = next_market.get('yes_token_id')
-        self._yes_instrument_id = next_market.get('yes_instrument_id', inst_id)
-        self._no_instrument_id = next_market.get('no_instrument_id')
+        self.instrument_id      = next_market.get('yes_instrument_id')
+        self.next_switch_time   = next_market['end_time']
+        self._yes_token_id      = next_market.get('yes_token_id')
+        self._no_token_id       = next_market.get('no_token_id')
+        self._yes_instrument_id = next_market.get('yes_instrument_id')
+        self._no_instrument_id  = next_market.get('no_instrument_id')
 
         logger.info("=" * 80)
         logger.info(f"SWITCHING TO NEXT 5-MIN MARKET: {next_market['slug']}")
@@ -536,7 +534,10 @@ class IntegratedBTCStrategy(Strategy):
         self._waiting_for_market_open = False
         self.last_trade_time = -1
 
-        self.subscribe_quote_ticks(self.instrument_id)
+        if self.instrument_id:
+            self.subscribe_quote_ticks(self.instrument_id)
+        else:
+            logger.warning(f"No InstrumentId for {next_market['slug']} — skipping subscribe")
         return True
 
     def _start_timer_loop(self):
