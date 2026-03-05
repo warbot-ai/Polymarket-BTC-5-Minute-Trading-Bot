@@ -32,6 +32,7 @@ from nautilus_trader.config import (
 from nautilus_trader.live.node import TradingNode
 from nautilus_trader.adapters.polymarket import POLYMARKET
 from nautilus_trader.adapters.polymarket import PolymarketDataClientConfig, PolymarketExecClientConfig
+from nautilus_trader.adapters.polymarket.common.constants import POLYMARKET_VENUE
 from nautilus_trader.adapters.polymarket.factories import (
     PolymarketLiveDataClientFactory, PolymarketLiveExecClientFactory,
 )
@@ -316,7 +317,7 @@ class IntegratedBTCStrategy(Strategy):
 
         # Subscribe to ALL incoming instruments so on_instrument() fires for each
         # one as the engine cache receives them from the provider.
-        self.subscribe_instruments(venue=None)
+        self.subscribe_instruments(venue=POLYMARKET_VENUE)
 
         # If the engine cache already has our instrument (unlikely but possible
         # on a warm restart) set up immediately.
