@@ -1,41 +1,26 @@
 """
-Tick Velocity Signal Processor
-Measures how fast the Polymarket UP probability is moving in the
-last 60 seconds before the trade window opens.
+Tick Velocity Signal Processor — 5-Minute Edition
 
-WHY THIS WORKS:
-  If the "Up" probability moves from 0.50 → 0.57 in the last 45 seconds,
-  BEFORE your bot even looks at it, that reflects real order flow from
-  other traders reacting to BTC spot movement. The probability is being
-  pushed by real money, and it often continues in the same direction
-  for at least another 30–60 seconds.
+Updated from 15m: uses 30s/15s windows instead of 60s/30s.
 
-  This is "price action" on the Polymarket itself — not a lagging
-  external indicator. It's the most direct signal available.
+WHY SHORTER WINDOWS FOR 5-MIN MARKETS:
+  In a 15-minute market, looking back 60 seconds means looking at the first
+  6.7% of the market — still very early, lots of noise.
 
-HOW IT WORKS:
-  The strategy stores a rolling tick buffer:
-    self._tick_buffer = deque of {'ts': datetime, 'price': Decimal}
+  In a 5-minute market at the 3:30 trade window:
+    - 60 seconds ago = the 2:30 mark = the first 50% of the market
+    - That early price is near 0.50 and not yet informative
+    - 30s ago = 3:00 mark = price is settling, more signal
+    - 15s ago = 3:15 mark = price is nearly where we're trading
 
-  This processor receives that buffer via metadata['tick_buffer'].
+  Using 30s/15s gives us velocity of the SETTLING phase of the market,
+  which is far more predictive than the opening noise phase.
 
-  It computes:
-    1. 60s velocity  = (now_price - price_60s_ago) / price_60s_ago
-    2. 30s velocity  = (now_price - price_30s_ago) / price_30s_ago
-    3. Acceleration  = 30s_velocity - (60s_velocity - 30s_velocity)
-                       (is it speeding up or slowing down?)
-
-  Signal thresholds (for 0–1 probability prices):
-    velocity > +1.5%  in 60s → BULLISH
-    velocity < -1.5%  in 60s → BEARISH
-    acceleration bonus: if move is accelerating → higher confidence
-
-INTEGRATION:
-  In bot.py on_quote_tick(), add:
-    self._tick_buffer.append({'ts': now, 'price': mid_price})
-
-  In _fetch_market_context(), add:
-    metadata['tick_buffer'] = list(self._tick_buffer)
+THRESHOLDS:
+  velocity_threshold_30s: 0.008 (0.8% in 30s) — was 0.010 for 15m
+    Lower because 5m probabilities move faster; 0.8% is already significant
+  velocity_threshold_15s: 0.005 (0.5% in 15s) — new, replaces 60s as secondary
+    Very short-term momentum just before the trade window
 """
 from decimal import Decimal
 from datetime import datetime, timezone, timedelta
@@ -48,55 +33,47 @@ import sys
 sys.path.insert(0, os.path.abspath(os.path.join(os.path.dirname(__file__), '../..')))
 
 from core.strategy_brain.signal_processors.base_processor import (
-    BaseSignalProcessor,
-    TradingSignal,
-    SignalType,
-    SignalDirection,
-    SignalStrength,
+    BaseSignalProcessor, TradingSignal, SignalType, SignalDirection, SignalStrength,
 )
 
 
 class TickVelocityProcessor(BaseSignalProcessor):
     """
-    Measures Polymarket probability velocity over the last 60 seconds.
+    Measures Polymarket probability velocity — 5-minute edition.
 
-    Fast moves in probability = real order flow = tradeable signal.
+    Uses 30s/15s windows (vs 60s/30s for 15m) because at the 3:30 trade
+    window, 60s ago is still in the noisy market-open phase.
     """
 
     def __init__(
         self,
-        velocity_threshold_60s: float = 0.015,   # 1.5% move in 60s
-        velocity_threshold_30s: float = 0.010,   # 1.0% move in 30s
-        min_ticks: int = 5,                       # need at least 5 ticks in window
+        velocity_threshold_60s: float = 0.012,   # kept for API compatibility
+        velocity_threshold_30s: float = 0.008,   # primary threshold (was 0.010)
+        velocity_threshold_15s: float = 0.005,   # new secondary threshold for 5m
+        min_ticks: int = 5,
         min_confidence: float = 0.55,
     ):
         super().__init__("TickVelocity")
 
         self.velocity_threshold_60s = velocity_threshold_60s
         self.velocity_threshold_30s = velocity_threshold_30s
+        self.velocity_threshold_15s = velocity_threshold_15s
         self.min_ticks = min_ticks
         self.min_confidence = min_confidence
 
         logger.info(
-            f"Initialized Tick Velocity Processor: "
-            f"60s_threshold={velocity_threshold_60s:.1%}, "
-            f"30s_threshold={velocity_threshold_30s:.1%}"
+            f"Initialized Tick Velocity Processor (5m edition): "
+            f"30s_threshold={velocity_threshold_30s:.1%}, "
+            f"15s_threshold={velocity_threshold_15s:.1%}"
         )
 
-    def _get_price_at(
-        self,
-        tick_buffer: List[Dict],
-        seconds_ago: float,
-        now: datetime,
-    ) -> Optional[float]:
+    def _get_price_at(self, tick_buffer: List[Dict], seconds_ago: float, now: datetime) -> Optional[float]:
         """Find the tick price closest to `seconds_ago` seconds before now."""
         target = now - timedelta(seconds=seconds_ago)
-        best = None
-        best_diff = float('inf')
+        best, best_diff = None, float('inf')
 
         for tick in tick_buffer:
             ts = tick['ts']
-            # Normalise timezone
             if ts.tzinfo is None:
                 ts = ts.replace(tzinfo=timezone.utc)
             diff = abs((ts - target).total_seconds())
@@ -104,10 +81,8 @@ class TickVelocityProcessor(BaseSignalProcessor):
                 best_diff = diff
                 best = float(tick['price'])
 
-        # Only return if within ±15s of target
-        if best_diff <= 15:
-            return best
-        return None
+        # For 5m markets, allow ±10s tolerance (was ±15s for 15m)
+        return best if best_diff <= 10 else None
 
     def process(
         self,
@@ -120,85 +95,76 @@ class TickVelocityProcessor(BaseSignalProcessor):
 
         tick_buffer = metadata.get("tick_buffer")
         if not tick_buffer or len(tick_buffer) < self.min_ticks:
-            logger.debug(
-                f"TickVelocity: insufficient ticks "
-                f"({len(tick_buffer) if tick_buffer else 0} < {self.min_ticks})"
-            )
             return None
 
         now = datetime.now(timezone.utc)
         curr = float(current_price)
 
-        # Get historical prices from the buffer
-        price_60s = self._get_price_at(tick_buffer, 60, now)
+        # Use 30s and 15s windows for 5-minute markets
         price_30s = self._get_price_at(tick_buffer, 30, now)
+        price_15s = self._get_price_at(tick_buffer, 15, now)
+        price_60s = self._get_price_at(tick_buffer, 60, now)  # fallback only
 
-        if price_60s is None and price_30s is None:
-            logger.debug("TickVelocity: no historical ticks in 60s window")
+        if price_30s is None and price_15s is None:
+            logger.debug("TickVelocity: no ticks in 15-30s window")
             return None
 
         # Compute velocities
-        vel_60s = ((curr - price_60s) / price_60s) if price_60s else None
         vel_30s = ((curr - price_30s) / price_30s) if price_30s else None
+        vel_15s = ((curr - price_15s) / price_15s) if price_15s else None
+        vel_60s = ((curr - price_60s) / price_60s) if price_60s else None
 
-        # Compute acceleration (is the move speeding up?)
+        # Acceleration: is the move speeding up in the last 15s vs 15-30s?
         acceleration = 0.0
-        if vel_60s is not None and vel_30s is not None:
-            # First half velocity = 60s vel - 30s vel (approximation)
-            vel_first_30s = vel_60s - vel_30s
-            acceleration = vel_30s - vel_first_30s  # positive = accelerating
+        if vel_30s is not None and vel_15s is not None:
+            vel_first_15s = vel_30s - vel_15s   # approximate first-half velocity
+            acceleration = vel_15s - vel_first_15s
 
         logger.info(
-            f"TickVelocity: curr={curr:.4f}, "
-            f"vel_60s={vel_60s*100:+.3f}% " if vel_60s else "vel_60s=N/A "
+            f"TickVelocity (5m): curr={curr:.4f}, "
             f"vel_30s={vel_30s*100:+.3f}% " if vel_30s else "vel_30s=N/A "
+            f"vel_15s={vel_15s*100:+.3f}% " if vel_15s else "vel_15s=N/A "
             f"accel={acceleration*100:+.4f}%"
         )
 
-        # Use best available velocity for signal decision
-        primary_vel = vel_30s if vel_30s is not None else vel_60s
-        threshold = (
-            self.velocity_threshold_30s if vel_30s is not None
-            else self.velocity_threshold_60s
-        )
-
-        if abs(primary_vel) < threshold:
-            logger.debug(
-                f"TickVelocity: {primary_vel*100:+.3f}% below threshold "
-                f"{threshold*100:.1f}% — no signal"
-            )
+        # Primary signal: use 15s velocity if available, else 30s, else 60s
+        if vel_15s is not None and abs(vel_15s) >= self.velocity_threshold_15s:
+            primary_vel = vel_15s
+            threshold = self.velocity_threshold_15s
+        elif vel_30s is not None and abs(vel_30s) >= self.velocity_threshold_30s:
+            primary_vel = vel_30s
+            threshold = self.velocity_threshold_30s
+        elif vel_60s is not None and abs(vel_60s) >= self.velocity_threshold_60s:
+            primary_vel = vel_60s
+            threshold = self.velocity_threshold_60s
+        else:
+            logger.debug("TickVelocity: below all thresholds — no signal")
             return None
 
         direction = SignalDirection.BULLISH if primary_vel > 0 else SignalDirection.BEARISH
         abs_vel = abs(primary_vel)
 
-        # Strength by velocity magnitude
-        if abs_vel >= 0.04:      # >4%
+        if abs_vel >= 0.04:
             strength = SignalStrength.VERY_STRONG
-        elif abs_vel >= 0.025:   # >2.5%
+        elif abs_vel >= 0.025:
             strength = SignalStrength.STRONG
-        elif abs_vel >= 0.015:   # >1.5%
+        elif abs_vel >= 0.012:
             strength = SignalStrength.MODERATE
         else:
             strength = SignalStrength.WEAK
 
-        # Base confidence
         confidence = min(0.82, 0.55 + (abs_vel / threshold - 1) * 0.12)
 
-        # Acceleration bonus: if move is accelerating, higher confidence
-        accel_same_direction = (
-            (acceleration > 0 and primary_vel > 0) or
-            (acceleration < 0 and primary_vel < 0)
-        )
-        if accel_same_direction and abs(acceleration) > 0.005:
+        # Acceleration bonus
+        accel_same_dir = (acceleration > 0 and primary_vel > 0) or (acceleration < 0 and primary_vel < 0)
+        if accel_same_dir and abs(acceleration) > 0.003:
             confidence = min(0.88, confidence + 0.06)
-            logger.info(f"TickVelocity: acceleration bonus applied ({acceleration*100:+.4f}%)")
+            logger.info(f"TickVelocity: acceleration bonus ({acceleration*100:+.4f}%)")
 
-        # If 60s velocity conflicts with 30s velocity — reduce confidence
-        if vel_60s is not None and vel_30s is not None:
-            if (vel_60s > 0) != (vel_30s > 0):
-                confidence *= 0.80
-                logger.info("TickVelocity: velocity reversal — confidence reduced")
+        # Conflict penalty: if 30s and 15s disagree, reduce confidence
+        if vel_30s is not None and vel_15s is not None and (vel_30s > 0) != (vel_15s > 0):
+            confidence *= 0.80
+            logger.info("TickVelocity: velocity reversal — confidence reduced")
 
         if confidence < self.min_confidence:
             return None
@@ -212,21 +178,20 @@ class TickVelocityProcessor(BaseSignalProcessor):
             confidence=confidence,
             current_price=current_price,
             metadata={
-                "velocity_60s": round(vel_60s, 6) if vel_60s else None,
                 "velocity_30s": round(vel_30s, 6) if vel_30s else None,
+                "velocity_15s": round(vel_15s, 6) if vel_15s else None,
+                "velocity_60s": round(vel_60s, 6) if vel_60s else None,
                 "acceleration": round(acceleration, 6),
-                "price_60s_ago": round(price_60s, 6) if price_60s else None,
-                "price_30s_ago": round(price_30s, 6) if price_30s else None,
+                "primary_window": "15s" if vel_15s is not None and abs(vel_15s) >= self.velocity_threshold_15s
+                                  else "30s" if vel_30s is not None else "60s",
                 "ticks_in_buffer": len(tick_buffer),
             }
         )
 
         self._record_signal(signal)
-
         logger.info(
-            f"Generated {direction.value.upper()} signal (TickVelocity): "
+            f"Generated {direction.value.upper()} signal (TickVelocity/5m): "
             f"vel={primary_vel*100:+.3f}%, accel={acceleration*100:+.4f}%, "
-            f"confidence={confidence:.2%}, score={signal.score:.1f}"
+            f"conf={confidence:.2%}, score={signal.score:.1f}"
         )
-
         return signal
