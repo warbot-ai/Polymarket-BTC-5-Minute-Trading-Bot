@@ -1368,6 +1368,17 @@ def run_integrated_bot(simulation: bool = False, enable_grafana: bool = True, te
         use_gamma_markets=True,
     )
 
+    # Sanity-check: log what the provider will see before building the node
+    logger.info("=" * 80)
+    logger.info("INSTRUMENT PROVIDER CONFIG CHECK")
+    logger.info(f"  load_all          = {instrument_cfg.load_all}")
+    logger.info(f"  use_gamma_markets = {instrument_cfg.use_gamma_markets}")
+    logger.info(f"  slug count        = {len(instrument_cfg.filters.get('slug', []))}")
+    logger.info("=" * 80)
+    if not instrument_cfg.load_all:
+        logger.error("FATAL: load_all is False — instruments will NOT load. Exiting.")
+        sys.exit(1)
+
     poly_data_cfg = PolymarketDataClientConfig(
         private_key=os.getenv("POLYMARKET_PK"),
         api_key=os.getenv("POLYMARKET_API_KEY"),
@@ -1375,6 +1386,7 @@ def run_integrated_bot(simulation: bool = False, enable_grafana: bool = True, te
         passphrase=os.getenv("POLYMARKET_PASSPHRASE"),
         signature_type=1,
         instrument_provider=instrument_cfg,
+        update_instruments_interval_mins=None,  # disable stale periodic refresh
     )
 
     poly_exec_cfg = PolymarketExecClientConfig(
