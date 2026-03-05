@@ -127,22 +127,46 @@ def apply_gamma_markets_patch():
         async def _load_all_using_gamma_markets(self, filters: dict | None = None) -> None:
             """
             Load all instruments using Gamma API with proper server-side filtering.
-            This is the CORRECT implementation that respects time filters.
+            Batches slug lists into chunks of 20 to avoid HTTP 414 (URL too long).
             """
             filters = filters.copy() if filters is not None else {}
-            
-            # Set reasonable defaults
+
             if "limit" not in filters:
-                filters["limit"] = 1000  # Get as many as possible per request
-            
-            self._log.info(f"Requesting markets from Gamma API with filters: {filters}")
-            
-            try:
+                filters["limit"] = 300
+
+            # Split slug list into batches of 20 to stay under URL length limits
+            SLUG_BATCH_SIZE = 20
+            slug_list = list(filters.pop("slug", []) or [])
+
+            self._log.info(f"Loading {len(slug_list)} slugs in batches of {SLUG_BATCH_SIZE}")
+
+            markets = []
+            if slug_list:
+                batches = [slug_list[i:i + SLUG_BATCH_SIZE] for i in range(0, len(slug_list), SLUG_BATCH_SIZE)]
+                for batch_num, batch in enumerate(batches):
+                    batch_filters = {**filters, "slug": tuple(batch)}
+                    self._log.debug(f"Fetching batch {batch_num + 1}/{len(batches)} ({len(batch)} slugs)")
+                    try:
+                        batch_markets = await gamma_markets.list_markets(
+                            http_client=self._http_client,
+                            filters=batch_filters,
+                            timeout=30.0,
+                        )
+                        markets.extend(batch_markets)
+                    except Exception as e:
+                        self._log.warning(f"Batch {batch_num + 1} failed: {e}")
+                        continue
+            else:
                 markets = await gamma_markets.list_markets(
-                    http_client=self._http_client, 
+                    http_client=self._http_client,
                     filters=filters,
-                    timeout=120.0
+                    timeout=120.0,
                 )
+
+            self._log.info(f"Requesting markets from Gamma API with filters: {filters}")
+
+            try:
+                pass  # markets already populated above
                 
                 self._log.info(f"✓ Gamma API returned {len(markets)} markets")
                 
@@ -177,8 +201,8 @@ def apply_gamma_markets_patch():
                         
                         # Log BTC markets specifically
                         slug = market.get('slug', '')
-                        if 'btc' in slug.lower() and '15m' in slug.lower():
-                            self._log.info(f"✓ Found BTC 15-min market: {slug}")
+                        if 'btc' in slug.lower() and '5m' in slug.lower():
+                            self._log.info(f"✓ Found BTC 5-min market: {slug}")
                         
                         for token_info in normalized_market.get("tokens", []):
                             token_id = token_info["token_id"]
