@@ -309,8 +309,17 @@ class IntegratedBTCStrategy(Strategy):
         logger.info("BTC 5-MIN STRATEGY STARTED")
         logger.info("=" * 80)
 
+        # Build the full market schedule from Gamma API (for queue display / timing).
+        # This populates self.all_btc_instruments with slug/token data but
+        # instrument_id may be None until the engine cache is populated.
         self._load_all_btc_instruments()
 
+        # Subscribe to ALL incoming instruments so on_instrument() fires for each
+        # one as the engine cache receives them from the provider.
+        self.subscribe_instruments(venue=None)
+
+        # If the engine cache already has our instrument (unlikely but possible
+        # on a warm restart) set up immediately.
         if self.instrument_id:
             logger.info(f"✓ SUBSCRIBED to market: {self.instrument_id}")
             try:
@@ -322,7 +331,7 @@ class IntegratedBTCStrategy(Strategy):
             except Exception:
                 pass
         else:
-            logger.warning("No active market InstrumentId yet — waiting for market open")
+            logger.info("Waiting for instruments to arrive in engine cache via on_instrument()...")
 
         if len(self.price_history) < 20:
             self._generate_synthetic_history(target_count=20, existing_count=len(self.price_history))
@@ -334,6 +343,63 @@ class IntegratedBTCStrategy(Strategy):
             threading.Thread(target=self._start_grafana_sync, daemon=True).start()
 
         logger.info(f"Strategy active — trading every 5 minutes | history: {len(self.price_history)} pts")
+
+    def on_instrument(self, instrument) -> None:
+        """
+        Called by Nautilus engine each time an instrument arrives in the cache.
+        We use this to resolve InstrumentId objects for our market list and
+        subscribe to quote ticks as soon as the relevant instrument is ready.
+        """
+        if not self.all_btc_instruments:
+            return
+
+        inst_id_str = str(instrument.id)
+        slug = ""
+        if hasattr(instrument, 'info') and instrument.info:
+            slug = instrument.info.get('market_slug', '').lower()
+
+        if not (('btc' in slug) and ('5m' in slug)):
+            return
+
+        # Update matching entry in our market list
+        for entry in self.all_btc_instruments:
+            if entry.get('slug') == slug:
+                # Determine YES vs NO by checking which token ID is in the instrument ID
+                yes_token = entry.get('yes_token_id', '')
+                if yes_token and yes_token in inst_id_str:
+                    entry['yes_instrument_id'] = instrument.id
+                    entry['instrument_id']      = instrument.id
+                    entry['instrument']         = instrument
+                    logger.debug(f"Resolved YES instrument for {slug}")
+                else:
+                    entry['no_instrument_id'] = instrument.id
+                    logger.debug(f"Resolved NO instrument for {slug}")
+                break
+
+        # Check if this instrument is the current active market
+        now = datetime.now(timezone.utc)
+        current_ts = int(now.timestamp())
+        for i, entry in enumerate(self.all_btc_instruments):
+            if entry.get('slug') != slug:
+                continue
+            is_active = entry['time_diff_minutes'] <= 0 and entry['end_timestamp'] > current_ts
+            yes_token = entry.get('yes_token_id', '')
+            is_yes    = yes_token and yes_token in inst_id_str
+
+            if is_active and is_yes and self.instrument_id is None:
+                self.current_instrument_index = i
+                self.instrument_id            = instrument.id
+                self._yes_instrument_id       = instrument.id
+                self.next_switch_time         = entry['end_time']
+                self._yes_token_id            = entry.get('yes_token_id')
+                self._no_token_id             = entry.get('no_token_id')
+                logger.info("=" * 80)
+                logger.info(f"✓ INSTRUMENT RESOLVED — subscribing to: {slug}")
+                logger.info(f"  InstrumentId: {instrument.id}")
+                logger.info(f"  Ends at: {self.next_switch_time.strftime('%H:%M:%S')}")
+                logger.info("=" * 80)
+                self.subscribe_quote_ticks(self.instrument_id)
+            break
 
     def _generate_synthetic_history(self, target_count=20, existing_count=0):
         base = self.price_history[-1] if self.price_history else Decimal("0.5")
